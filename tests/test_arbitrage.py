@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 
 from src.arbitrage import Book, Pricer, per_contract_fee
 from src.strategy import Strategy
@@ -56,3 +57,36 @@ def test_strategy_enters_at_the_edge_and_sells_only_at_the_target(kalshi_fee, po
     assert s.entry(narrow) is None
     assert s.should_exit(0.021) and s.should_exit(0.02)
     assert not s.should_exit(0.019) and not s.should_exit(-0.05) and not s.should_exit(None)
+
+
+def test_entry_fees_use_the_depth_limited_whole_contract_size(kalshi_fee, poly_fee):
+    pricer = Pricer(kalshi_fee, poly_fee, contracts=1000)
+    best = pricer.opportunities(Book(0.39, 0.40, 100, 1.9), Book(0.46, 0.47, 100, 100))[0]
+    assert best.yes.fee == per_contract_fee(kalshi_fee, 0.40, 1)
+
+
+def test_unwind_uses_the_actual_held_size_for_fee_rounding(kalshi_fee, poly_fee):
+    pricer = Pricer(kalshi_fee, poly_fee, contracts=1000)
+    opp = pricer.opportunities(Book(0.39, 0.40), Book(0.46, 0.47))[0]
+    k, p = Book(0.45, 0.46), Book(0.45, 0.46)
+    fees = per_contract_fee(kalshi_fee, 0.45, 1) + per_contract_fee(poly_fee, 0.54, 1)
+    assert pricer.unwind(opp, k, p, contracts=1) == pytest.approx(0.99 - opp.cost - opp.fees - fees, abs=1e-4)
+
+
+def test_exit_requires_enough_top_of_book_depth(kalshi_fee, poly_fee):
+    pricer = Pricer(kalshi_fee, poly_fee)
+    opp = pricer.opportunities(Book(0.39, 0.40), Book(0.46, 0.47))[0]
+    assert pricer.unwind(opp, Book(0.48, 0.49, 1, 100), Book(0.44, 0.45, 100, 100), contracts=10) is None
+    assert pricer.unwind(opp, Book(0.48, 0.49, 100, 100), Book(0.44, 0.45, 100, 1), contracts=10) is None
+
+
+@pytest.mark.parametrize("contracts", [0, -1, float("nan"), float("inf")])
+def test_invalid_contract_counts_are_rejected(kalshi_fee, poly_fee, contracts):
+    with pytest.raises(ValueError, match="contracts"):
+        Pricer(kalshi_fee, poly_fee, contracts=contracts)
+
+
+def test_unknown_fee_is_not_assumed_to_be_zero():
+    schedule = SimpleNamespace(estimate=lambda price, contracts: None)
+    with pytest.raises(ValueError, match="fee estimate is unavailable"):
+        per_contract_fee(schedule, 0.5, 100)

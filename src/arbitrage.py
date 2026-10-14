@@ -13,6 +13,7 @@ to sell) plus each venue's taker fee from its published schedule.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from synpath import FeeSchedule
 
@@ -55,10 +56,16 @@ class Book:
 def per_contract_fee(schedule: FeeSchedule, price: float, contracts: float) -> float:
     """Taker fee per contract for an order of `contracts` at `price`. Kalshi rounds the fee of
     each order up to the cent, so the size matters."""
+    if not math.isfinite(contracts) or contracts <= 0:
+        raise ValueError("contracts must be finite and positive")
+    if not math.isfinite(price) or not 0 <= price <= 1:
+        raise ValueError("price must be finite and between zero and one")
     if price <= 0 or price >= 1:
         return 0.0
     fee = schedule.estimate(price, contracts)
-    return 0.0 if fee is None else fee / contracts
+    if fee is None or not math.isfinite(fee):
+        raise ValueError("taker fee estimate is unavailable")
+    return fee / contracts
 
 
 @dataclass(frozen=True)
@@ -98,11 +105,15 @@ class Opportunity:
 
 class Pricer:
     def __init__(self, kalshi_fee: FeeSchedule, poly_fee: FeeSchedule, *, contracts: float = 1000):
+        if not math.isfinite(contracts) or contracts < 1:
+            raise ValueError("contracts must be finite and at least one")
         self.fee = {"kalshi": kalshi_fee, "polymarket": poly_fee}
         self.contracts = contracts
 
-    def leg(self, venue: str, side: str, price: float, size: float | None = None) -> Leg:
-        return Leg(venue, side, price, per_contract_fee(self.fee[venue], price, self.contracts), size)
+    def leg(self, venue: str, side: str, price: float, size: float | None = None,
+            *, contracts: float | None = None) -> Leg:
+        quantity = self.contracts if contracts is None else contracts
+        return Leg(venue, side, price, per_contract_fee(self.fee[venue], price, quantity), size)
 
     def opportunities(self, kalshi: Book, poly: Book) -> list[Opportunity]:
         """Both combinations that can be priced, best edge first. Empty when the books disagree
@@ -117,25 +128,38 @@ class Pricer:
         ):
             if yes_book.ask is None or no_book.no_ask is None:
                 continue
+            sizes = [s for s in (yes_book.ask_size, no_book.bid_size) if s is not None]
+            if any(not math.isfinite(s) or s < 0 for s in sizes):
+                continue
+            contracts = math.floor(min([self.contracts, *sizes]))
+            if contracts < 1:
+                continue
             out.append(Opportunity(direction,
-                                   self.leg(yes_venue, "yes", yes_book.ask, yes_book.ask_size),
-                                   self.leg(no_venue, "no", no_book.no_ask, no_book.bid_size)))
+                                   self.leg(yes_venue, "yes", yes_book.ask, yes_book.ask_size, contracts=contracts),
+                                   self.leg(no_venue, "no", no_book.no_ask, no_book.bid_size, contracts=contracts)))
         return sorted(out, key=lambda o: -o.edge)
 
-    def exit_prices(self, opp: Opportunity, kalshi: Book, poly: Book) -> tuple[float, float] | None:
+    def exit_prices(self, opp: Opportunity, kalshi: Book, poly: Book,
+                    *, contracts: float | None = None) -> tuple[float, float] | None:
         """What selling each leg fetches now: the YES leg at its venue's YES bid, the NO leg at its
         venue's NO bid. `None` when either side has no bid."""
         books = {"kalshi": kalshi, "polymarket": poly}
         yes_bid, no_bid = books[opp.yes.venue].bid, books[opp.no.venue].no_bid
         if yes_bid is None or no_bid is None:
             return None
+        if contracts is not None:
+            sizes = (books[opp.yes.venue].bid_size, books[opp.no.venue].ask_size)
+            if any(s is not None and (not math.isfinite(s) or s < contracts) for s in sizes):
+                return None
         return yes_bid, no_bid
 
-    def unwind(self, opp: Opportunity, kalshi: Book, poly: Book) -> float | None:
+    def unwind(self, opp: Opportunity, kalshi: Book, poly: Book,
+               *, contracts: float | None = None) -> float | None:
         """Profit per pair if both legs were sold now: the round trip after entry and exit fees."""
-        prices = self.exit_prices(opp, kalshi, poly)
+        prices = self.exit_prices(opp, kalshi, poly, contracts=contracts)
         if prices is None:
             return None
         yes_bid, no_bid = prices
-        exit_fees = self.leg(opp.yes.venue, "yes", yes_bid).fee + self.leg(opp.no.venue, "no", no_bid).fee
+        exit_fees = (self.leg(opp.yes.venue, "yes", yes_bid, contracts=contracts).fee
+                     + self.leg(opp.no.venue, "no", no_bid, contracts=contracts).fee)
         return round(yes_bid + no_bid - opp.cost - opp.fees - exit_fees, 4)

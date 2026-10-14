@@ -123,8 +123,8 @@ class ArbitrageBot:
     def maybe_exit(self, pair: Pair, pos: Position, kalshi: Book, poly: Book) -> None:
         pricer = self.pricers[pair.kalshi_id]
         opp = pos.as_opportunity()
-        round_trip = pricer.unwind(opp, kalshi, poly)
-        prices = pricer.exit_prices(opp, kalshi, poly)
+        round_trip = pricer.unwind(opp, kalshi, poly, contracts=pos.contracts)
+        prices = pricer.exit_prices(opp, kalshi, poly, contracts=pos.contracts)
         if not self.strategy.should_exit(round_trip) or prices is None:
             if not self._status_due(pair):
                 return
